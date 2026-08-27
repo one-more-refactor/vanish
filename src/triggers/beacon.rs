@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 use zbus::zvariant::OwnedValue;
 use zbus::{proxy, Connection};
 
@@ -92,18 +92,27 @@ pub async fn run(cfg: Beacon, tx: mpsc::Sender<Signal>) -> Result<()> {
     let addr = cfg.address.to_uppercase();
     let conn = Connection::system().await?;
 
-    if cfg.own_discovery {
-        // Discovery has to be running for any advertisement to reach us. bluez
-        // reference-counts it per D-Bus client, so asking for it here does not
-        // fight notchd or blueman asking for it too.
-        if let Ok(a) = AdapterProxy::builder(&conn).path("/org/bluez/hci0")?.build().await {
-            if a.powered().await.unwrap_or(false) && !a.discovering().await.unwrap_or(false) {
-                if let Err(e) = a.start_discovery().await {
-                    warn!(%e, "could not start discovery; in-ear and RSSI will be unavailable");
-                }
+    // Discovery has to be running for any advertisement to reach us, and it
+    // does not stay running by itself: a suspend/resume cycle re-initialises
+    // the adapter and every client's discovery quietly ends. Asking once at
+    // startup — worse, asking only when nobody else is discovering — leaves
+    // the beacon permanently blind after the first time the machine sleeps,
+    // and blind fails safe, so nothing ever complains. Observed on 2026-08-27:
+    // Discovering=false with two daemons that both believed they had asked.
+    //
+    // So it is re-asserted on every tick. bluez reference-counts discovery per
+    // D-Bus client, so this neither fights notchd nor accumulates state.
+    let adapter = if cfg.own_discovery {
+        match AdapterProxy::builder(&conn).path("/org/bluez/hci0")?.build().await {
+            Ok(a) => Some(a),
+            Err(e) => {
+                warn!(%e, "no adapter at /org/bluez/hci0; in-ear and RSSI unavailable");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
     let mut r = Reading::default();
     // Was the beacon trustworthy on the previous tick? Only a fall from armed
@@ -112,8 +121,34 @@ pub async fn run(cfg: Beacon, tx: mpsc::Sender<Signal>) -> Result<()> {
     let mut below_since: Option<Instant> = None;
     let mut last_note = String::new();
 
+    // Only complain about discovery once per outage, not every two seconds.
+    let mut discovery_warned = false;
+
     loop {
         tokio::time::sleep(TICK).await;
+
+        if let Some(a) = &adapter {
+            match a.discovering().await {
+                Ok(false) if a.powered().await.unwrap_or(false) => {
+                    match a.start_discovery().await {
+                        Ok(()) => {
+                            if discovery_warned {
+                                info!("discovery restarted");
+                                discovery_warned = false;
+                            }
+                        }
+                        Err(e) => {
+                            if !discovery_warned {
+                                warn!(%e, "cannot start discovery; the beacon is blind until this clears");
+                                discovery_warned = true;
+                            }
+                        }
+                    }
+                }
+                _ => discovery_warned = false,
+            }
+        }
+
         if let Err(e) = poll(&conn, &addr, &mut r).await {
             warn!(%e, "bluez read failed");
             continue;
