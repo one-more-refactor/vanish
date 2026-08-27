@@ -1,0 +1,19 @@
+[Unit]
+Description=vanish — presence-based session lock
+Documentation=https://github.com/one-more-refactor/vanish
+# Session-scoped: it locks the session on seat0, so it has no business running
+# when there is no graphical session to lock.
+PartOf=graphical-session.target
+After=graphical-session.target bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vanish run
+Environment=VANISH_LOG=info
+# It is the thing standing between an empty desk and an unlocked screen. If it
+# dies it comes back — and it comes back disarmed only if the config says so.
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=niri.service

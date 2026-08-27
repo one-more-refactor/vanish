@@ -1,0 +1,81 @@
+# vanish — copy to ~/.config/vanish/config.toml and edit.
+#
+# Locking is not destructive, so this ships armed. What it does NOT ship with
+# is any trigger enabled: vanish cannot guess which USB device is yours or
+# which headset is on your head, and guessing wrong locks your screen.
+
+[general]
+# false = watch and log, never lock. Same as running with --dry-run, but it
+# survives a restart.
+armed = true
+# Seconds between "you appear to be gone" and the lock. The window exists to be
+# cancelled — plug the anchor back in, or let the headset reconnect, and the
+# countdown is called off. notchd shows it on screen if it is running.
+grace_secs = 20
+# Never lock again this soon after the last lock. A bluetooth link that flaps
+# would otherwise re-lock the session while you are typing your password.
+cooldown_secs = 60
+# Empty means logind: `loginctl lock-session <the session on seat0>`, which is
+# what the idle path and the suspend path already use. Set a shell command here
+# only if you run your locker directly (e.g. "swaylock -f").
+lock_command = ""
+# Ask notchd to count the grace window down on screen. No-op without notchd.
+notch = true
+
+# ── The anchor: a USB device that leaves when you do ──────────────────────────
+# A stick on your keyring, or the far end of a magnetic breakaway cable clipped
+# to your belt. `vanish learn` prints this whole block for you: run it, unplug
+# the device, plug it back in.
+[anchor]
+enabled = false
+vendor_id = "1050"
+product_id = "0402"
+# Optional. Pins to one physical device when you own two of the same model.
+serial = ""
+# Backstop poll, in case a netlink event is ever missed.
+poll_ms = 2000
+# A pulled cable is deliberate, so it does not get the long window.
+grace_secs = 3
+
+# ── The beacon: the headset you are already wearing ───────────────────────────
+[beacon]
+enabled = false
+# From `bluetoothctl devices`.
+address = ""
+# Only trust the headset as evidence while it has recently been IN YOUR EARS.
+# Without this, putting the buds in their case looks exactly like walking out
+# of the building, and the screen locks while you sit in front of it.
+# Requires AirPods (the in-ear bit comes from Apple's proximity advertisement).
+# For any other headset set this false and accept the ambiguity.
+require_in_ear = true
+# How long an in-ear reading stays good — long enough to take a bud out for a
+# conversation without disarming the beacon.
+in_ear_memory_secs = 600
+# Ask bluez to keep scanning, which is what makes the advertisement audible.
+# Harmless if something else (notchd, blueman) already asked.
+own_discovery = true
+# Optional distance path: lock when the smoothed signal stays below this for
+# rssi_hold_secs. 0 = off, which is the default because the right number is a
+# property of your walls. Run `vanish rssi`, walk to where "away" begins, and
+# use what it prints (a negative number, e.g. -85).
+away_rssi = 0
+rssi_hold_secs = 15
+# Backstop: lock when nothing has been heard at all for this long. 0 = off.
+silence_secs = 0
+# Inherits general.grace_secs unless set.
+# grace_secs = 20
+
+# ── The webhook: everything else that can decide you are gone ─────────────────
+# A camera that stopped seeing a face, a motion sensor, a phone geofence.
+#   curl -X POST -H "Authorization: Bearer $TOKEN" \
+#        -d '{"reason":"no face for 30s"}' http://127.0.0.1:9911/lock
+[webhook]
+enabled = false
+# Loopback on purpose. Binding this to a LAN address hands everyone on it a
+# button that locks your workstation.
+bind = "127.0.0.1:9911"
+# `vanish gen-token`. Empty = the listener refuses to start.
+token = ""
+path = "/lock"
+# 0 means lock immediately: whatever posted this has already made the decision.
+grace_secs = 0
