@@ -75,6 +75,15 @@ pub struct Beacon {
     /// Ask bluez to keep scanning. Needed for the proximity advertisement that
     /// carries in-ear state; harmless if something else (notchd) already does.
     pub own_discovery: bool,
+    /// Seconds of scanning per cycle, and how long a cycle lasts. Scanning is
+    /// not free: on a combo chip the bluetooth radio and 2.4 GHz wifi share one
+    /// antenna, and a discovery that never stops audibly chops up A2DP on the
+    /// very headset this trigger is watching. The in-ear bit only has to be
+    /// refreshed well inside `in_ear_memory_secs`, so a short window per cycle
+    /// buys the same evidence for a fraction of the airtime. 0 for either one
+    /// restores the old always-on behaviour.
+    pub scan_secs: u64,
+    pub scan_period_secs: u64,
     /// Lock when smoothed RSSI stays below this for `rssi_hold_secs`.
     /// 0 disables the distance path entirely — see `vanish rssi` to pick one.
     pub away_rssi: i32,
@@ -133,6 +142,8 @@ impl Default for Beacon {
             require_in_ear: true,
             in_ear_memory_secs: 600,
             own_discovery: true,
+            scan_secs: 6,
+            scan_period_secs: 30,
             away_rssi: 0,
             rssi_hold_secs: 15,
             silence_secs: 0,

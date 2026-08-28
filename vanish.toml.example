@@ -54,6 +54,13 @@ in_ear_memory_secs = 600
 # Ask bluez to keep scanning, which is what makes the advertisement audible.
 # Harmless if something else (notchd, blueman) already asked.
 own_discovery = true
+# Scan in windows instead of continuously: scan_secs of every scan_period_secs.
+# On a combo wifi/bluetooth chip the two share an antenna, and a scan that never
+# stops chops up the audio on the very headset this is watching. The in-ear bit
+# only needs refreshing well inside in_ear_memory_secs, so a short window is the
+# same evidence for a fraction of the airtime. Set either to 0 to scan always.
+scan_secs = 6
+scan_period_secs = 30
 # Optional distance path: lock when the smoothed signal stays below this for
 # rssi_hold_secs. 0 = off, which is the default because the right number is a
 # property of your walls. Run `vanish rssi`, walk to where "away" begins, and

@@ -66,6 +66,7 @@ const ALPHA: f32 = 0.3;
 #[proxy(interface = "org.bluez.Adapter1", default_service = "org.bluez")]
 trait Adapter {
     fn start_discovery(&self) -> zbus::Result<()>;
+    fn stop_discovery(&self) -> zbus::Result<()>;
     #[zbus(property)]
     fn powered(&self) -> zbus::Result<bool>;
     #[zbus(property)]
@@ -82,6 +83,21 @@ pub struct Reading {
     pub in_ear: Option<bool>,
     pub last_ad: Option<Instant>,
     pub last_in_ear: Option<Instant>,
+}
+
+/// Where we are in the scan cycle, in seconds.
+///
+/// Deliberately keyed to the wall clock rather than to when this process
+/// started. notchd runs the same duty cycle off the same clock, so the two
+/// daemons land on the SAME window without talking to each other. Left to
+/// their own start times they would drift apart, and since bluez scans
+/// whenever any client wants it, two 20% cycles out of phase cost nearly 40%
+/// of the airtime instead of 20%.
+fn cycle_pos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub async fn run(cfg: Beacon, tx: mpsc::Sender<Signal>) -> Result<()> {
@@ -124,12 +140,33 @@ pub async fn run(cfg: Beacon, tx: mpsc::Sender<Signal>) -> Result<()> {
     // Only complain about discovery once per outage, not every two seconds.
     let mut discovery_warned = false;
 
+    // Length of one scan/idle cycle, or None when the duty cycle is disabled.
+    let cycle = match (cfg.scan_secs, cfg.scan_period_secs) {
+        (0, _) | (_, 0) => None,
+        (w, p) if w >= p => None,
+        (_, p) => Some(p),
+    };
+    if let Some(p) = cycle {
+        info!(scan = cfg.scan_secs, period = p, "beacon scanning on a duty cycle");
+    }
+
     loop {
         tokio::time::sleep(TICK).await;
 
+        // Scan in short windows rather than continuously. Discovery is still
+        // re-asserted rather than asked for once — a suspend/resume silently
+        // ends it, and blind fails safe, so nothing would ever complain — but
+        // it is now also given back between windows so the radio is idle most
+        // of the time. See the note on `scan_secs` in the config.
         if let Some(a) = &adapter {
-            match a.discovering().await {
-                Ok(false) if a.powered().await.unwrap_or(false) => {
+            let want = match cycle {
+                Some(len) => cycle_pos() % len < cfg.scan_secs,
+                // Duty cycle switched off: hold discovery the way this used to.
+                None => true,
+            };
+            if a.powered().await.unwrap_or(false) {
+                let on = a.discovering().await.unwrap_or(false);
+                if want && !on {
                     match a.start_discovery().await {
                         Ok(()) => {
                             if discovery_warned {
@@ -144,8 +181,14 @@ pub async fn run(cfg: Beacon, tx: mpsc::Sender<Signal>) -> Result<()> {
                             }
                         }
                     }
+                } else if !want && on {
+                    // Only drops OUR reference; notchd's scan, if it holds one,
+                    // keeps the adapter discovering and this is a no-op.
+                    let _ = a.stop_discovery().await;
+                    discovery_warned = false;
+                } else {
+                    discovery_warned = false;
                 }
-                _ => discovery_warned = false,
             }
         }
 
