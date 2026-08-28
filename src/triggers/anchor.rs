@@ -46,6 +46,11 @@ pub fn spawn(cfg: Anchor, tx: mpsc::Sender<Signal>) {
         }
     };
 
+    // A pulled anchor is a deliberate act and gets the short window from
+    // [anchor].grace_secs. This used to be hardcoded to None, so the config key
+    // documented itself in the example file and then did nothing: an anchor
+    // pull sat through the full 20-second beacon grace instead of 3.
+    let grace = cfg.grace_secs;
     let found = find(&want);
     let state = Arc::new(Mutex::new(State {
         present: found.is_some(),
@@ -65,6 +70,7 @@ pub fn spawn(cfg: Anchor, tx: mpsc::Sender<Signal>) {
     // Detector 1: the kernel's own broadcast.
     {
         let (want, state, tx) = (want.clone(), state.clone(), tx.clone());
+        let grace = grace;
         std::thread::Builder::new()
             .name("anchor-uevent".into())
             .spawn(move || match UeventSocket::open() {
@@ -83,7 +89,7 @@ pub fn spawn(cfg: Anchor, tx: mpsc::Sender<Signal>) {
                             }
                             match ev.action.as_str() {
                                 "remove" => {
-                                    if !update(&state, &tx, false, "unplugged") {
+                                    if !update(&state, &tx, grace, false, "unplugged") {
                                         return;
                                     }
                                 }
@@ -92,7 +98,7 @@ pub fn spawn(cfg: Anchor, tx: mpsc::Sender<Signal>) {
                                 "add" | "bind" => {
                                     if let Some(p) = find(&want) {
                                         state.lock().unwrap().devpath = Some(p.clone());
-                                        if !update(&state, &tx, true, "plugged back in") {
+                                        if !update(&state, &tx, grace, true, "plugged back in") {
                                             return;
                                         }
                                     }
@@ -125,9 +131,9 @@ pub fn spawn(cfg: Anchor, tx: mpsc::Sender<Signal>) {
                 let alive = match find(&want) {
                     Some(p) => {
                         state.lock().unwrap().devpath = Some(p);
-                        update(&state, &tx, true, "plugged back in")
+                        update(&state, &tx, grace, true, "plugged back in")
                     }
-                    None => update(&state, &tx, false, "gone (noticed by poll)"),
+                    None => update(&state, &tx, grace, false, "gone (noticed by poll)"),
                 };
                 if !alive {
                     return;
@@ -139,7 +145,13 @@ pub fn spawn(cfg: Anchor, tx: mpsc::Sender<Signal>) {
 
 /// Change the flag and report it — but only on an edge. Both detectors call
 /// this constantly; only the transition is news.
-fn update(state: &Arc<Mutex<State>>, tx: &mpsc::Sender<Signal>, present: bool, why: &str) -> bool {
+fn update(
+    state: &Arc<Mutex<State>>,
+    tx: &mpsc::Sender<Signal>,
+    grace: Option<u64>,
+    present: bool,
+    why: &str,
+) -> bool {
     let mut st = state.lock().unwrap();
     if st.present == present {
         return true;
@@ -153,7 +165,7 @@ fn update(state: &Arc<Mutex<State>>, tx: &mpsc::Sender<Signal>, present: bool, w
     let sig = if present {
         Signal::Back { source: Source::Anchor, detail: why.to_string() }
     } else {
-        Signal::Away { source: Source::Anchor, detail: why.to_string(), grace: None }
+        Signal::Away { source: Source::Anchor, detail: why.to_string(), grace }
     };
     tx.blocking_send_or_log(sig)
 }
