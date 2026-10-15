@@ -1,6 +1,13 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/mark-dark.svg">
+  <img src=".github/brand/mark-light.svg" alt="" width="32" height="32">
+</picture>
+
 # vanish
 
 Your desktop locks itself when you are not in front of it.
+
+<img src=".github/brand/kind-tool.svg" alt="kind: tool" height="20">&nbsp;<img src=".github/brand/status-live.svg" alt="status: live" height="20">
 
 > **Alpha — v0.1.0-alpha.** Running on exactly one machine, mine. Config keys,
 > defaults and the control socket can all change without notice.
@@ -190,3 +197,13 @@ lock you out of your own machine when you pull the anchor.
 ## License
 
 GPL-3.0-or-later.
+
+---
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/lockup-dark.svg">
+  <img src=".github/brand/lockup-light.svg" alt="one more" height="20">
+</picture>
+
+part of [one more](https://github.com/one-more-refactor) — small tools that
+keep their data in plain files and never ask you to make an account.
