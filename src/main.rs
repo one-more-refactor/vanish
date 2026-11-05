@@ -226,7 +226,7 @@ async fn rssi(addr: Option<String>) -> Result<()> {
         if let Err(e) = triggers::beacon::poll(&conn, &addr, &mut r).await {
             eprintln!("bluez: {e}");
         }
-        let worn = r.last_in_ear.is_some_and(|t| t.elapsed() < Duration::from_secs(600));
+        let worn = triggers::beacon::worn(&config::Beacon::default(), &r, std::time::Instant::now());
         println!("{}", triggers::beacon::summary(&r, r.connected && worn, worn));
         tokio::time::sleep(Duration::from_secs(1)).await;
     }

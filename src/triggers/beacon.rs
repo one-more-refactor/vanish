@@ -131,10 +131,7 @@ pub async fn run(cfg: Beacon, tx: mpsc::Sender<Signal>) -> Result<()> {
     };
 
     let mut r = Reading::default();
-    // Was the beacon trustworthy on the previous tick? Only a fall from armed
-    // to not-armed is news; starting up with the headset in its case is not.
-    let mut was_armed = false;
-    let mut below_since: Option<Instant> = None;
+    let mut judge = Judge::default();
     let mut last_note = String::new();
 
     // Only complain about discovery once per outage, not every two seconds.
@@ -197,21 +194,102 @@ pub async fn run(cfg: Beacon, tx: mpsc::Sender<Signal>) -> Result<()> {
             continue;
         }
 
-        let now = Instant::now();
-        let worn = !cfg.require_in_ear
-            || r.last_in_ear
-                .is_some_and(|t| now.duration_since(t) < Duration::from_secs(cfg.in_ear_memory_secs));
+        let name = display_name(&r, &addr);
+        let step = judge.step(&cfg, &r, &name, Instant::now());
+
+        let note = summary(&r, step.armed, step.worn);
+        if note != last_note {
+            last_note = note.clone();
+            let _ = tx.send(Signal::Note { source: Source::Beacon, text: note }).await;
+        }
+
+        match step.verdict {
+            Some(Verdict::Away(detail)) => {
+                let _ = tx
+                    .send(Signal::Away { source: Source::Beacon, detail, grace: cfg.grace_secs })
+                    .await;
+            }
+            Some(Verdict::Back(detail)) => {
+                let _ = tx.send(Signal::Back { source: Source::Beacon, detail }).await;
+            }
+            None => {}
+        }
+    }
+}
+
+/// Is the headset on somebody's head, as far as we can tell?
+///
+/// "Recently in an ear" is not enough on its own: the last advertisement we
+/// heard may say both buds are OUT, and buds that were just taken out and are
+/// about to go in the case are exactly the false lock this gate exists for.
+/// The memory only bridges the gaps where nothing was heard at all (between
+/// scan windows, or a bud out for a conversation while the other stays in).
+pub fn worn(cfg: &Beacon, r: &Reading, now: Instant) -> bool {
+    if !cfg.require_in_ear {
+        return true;
+    }
+    r.in_ear != Some(false)
+        && r.last_in_ear
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(cfg.in_ear_memory_secs))
+}
+
+/// What the beacon concluded on one tick.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Away(String),
+    Back(String),
+}
+
+#[derive(Debug)]
+pub struct Step {
+    /// Connected and worn: the beacon counts as evidence right now.
+    pub armed: bool,
+    pub worn: bool,
+    pub verdict: Option<Verdict>,
+}
+
+/// The beacon's decision, kept apart from bluez so it can be tested.
+///
+/// Edge-triggered: one `Away` when the beacon starts saying "gone", one
+/// `Back` when it stops. The arbiter treats the beacon as a state, so a
+/// repeated `Away` would mean nothing, and a missing `Back` would leave it
+/// believing you are gone forever.
+#[derive(Debug, Default)]
+pub struct Judge {
+    /// Was the beacon trustworthy on the previous tick? Only a fall from armed
+    /// to not-armed is news; starting up with the headset in its case is not.
+    was_armed: bool,
+    /// The link dropped while the beacon was worn, and has not come back.
+    dropped: bool,
+    below_since: Option<Instant>,
+    gone: bool,
+}
+
+impl Judge {
+    pub fn step(&mut self, cfg: &Beacon, r: &Reading, name: &str, now: Instant) -> Step {
+        let worn = worn(cfg, r, now);
         let armed = r.connected && worn;
+
+        // Only a LINK DROP while worn is evidence. Losing the "worn" status
+        // while still connected (buds out on the desk, or the in-ear memory
+        // running out) just means the beacon stops counting — the person is
+        // very likely still sitting right there.
+        if self.was_armed && !armed && !r.connected {
+            self.dropped = true;
+        }
+        if r.connected {
+            self.dropped = false;
+        }
 
         // Distance, when it has been switched on.
         let far = if cfg.away_rssi != 0 {
             match r.rssi {
                 Some(v) if v < cfg.away_rssi as f32 => {
-                    let since = *below_since.get_or_insert(now);
+                    let since = *self.below_since.get_or_insert(now);
                     now.duration_since(since) >= Duration::from_secs(cfg.rssi_hold_secs)
                 }
                 _ => {
-                    below_since = None;
+                    self.below_since = None;
                     false
                 }
             }
@@ -223,55 +301,30 @@ pub async fn run(cfg: Beacon, tx: mpsc::Sender<Signal>) -> Result<()> {
         // buds in a case stop advertising too.
         let silent = cfg.silence_secs != 0
             && armed
-            && r.last_ad.is_some_and(|t| {
-                now.duration_since(t) >= Duration::from_secs(cfg.silence_secs)
-            });
+            && r.last_ad
+                .is_some_and(|t| now.duration_since(t) >= Duration::from_secs(cfg.silence_secs));
 
-        let note = summary(&r, armed, worn);
-        if note != last_note {
-            last_note = note.clone();
-            let _ = tx.send(Signal::Note { source: Source::Beacon, text: note }).await;
-        }
-
-        let gone = if was_armed && !armed {
-            // The distinction matters for the log line, and only for that:
-            // both end in the same countdown.
-            Some(if r.connected {
-                "worn beacon went quiet".to_string()
+        let far = armed && far;
+        let gone = self.dropped || far || silent;
+        let verdict = match (self.gone, gone) {
+            (false, true) => Some(Verdict::Away(if self.dropped {
+                format!("{name} disconnected")
+            } else if far {
+                format!(
+                    "{name} is far ({} dBm for {}s)",
+                    r.rssi.map(|v| v.round() as i32).unwrap_or_default(),
+                    cfg.rssi_hold_secs
+                )
             } else {
-                format!("{} disconnected", display_name(&r, &addr))
-            })
-        } else if armed && far {
-            Some(format!(
-                "{} is far ({} dBm for {}s)",
-                display_name(&r, &addr),
-                r.rssi.map(|v| v.round() as i32).unwrap_or_default(),
-                cfg.rssi_hold_secs
-            ))
-        } else if silent {
-            Some(format!("{} stopped advertising", display_name(&r, &addr)))
-        } else {
-            None
+                format!("{name} stopped advertising")
+            })),
+            (true, false) => Some(Verdict::Back(format!("{name} is back"))),
+            _ => None,
         };
 
-        match gone {
-            Some(detail) => {
-                let _ = tx
-                    .send(Signal::Away { source: Source::Beacon, detail, grace: cfg.grace_secs })
-                    .await;
-            }
-            None if armed && !was_armed => {
-                let _ = tx
-                    .send(Signal::Back {
-                        source: Source::Beacon,
-                        detail: format!("{} is back", display_name(&r, &addr)),
-                    })
-                    .await;
-            }
-            None => {}
-        }
-
-        was_armed = armed;
+        self.gone = gone;
+        self.was_armed = armed;
+        Step { armed, worn, verdict }
     }
 }
 
@@ -404,6 +457,148 @@ mod tests {
         // The other bud being the primary one moves the flag to bit 3.
         assert_eq!(in_ear_from_payload(&payload(0x08)), Some(true));
         assert_eq!(in_ear_from_payload(&payload(0x00)), Some(false));
+    }
+
+    // ── Judge ────────────────────────────────────────────────────────────
+
+    fn cfg() -> Beacon {
+        Beacon { enabled: true, address: "AA:BB:CC:DD:EE:FF".into(), ..Beacon::default() }
+    }
+
+    /// Connected, last advertisement says in-ear, heard at `t`.
+    fn worn_at(t: Instant) -> Reading {
+        Reading {
+            connected: true,
+            name: "buds".into(),
+            rssi: Some(-55.0),
+            in_ear: Some(true),
+            last_ad: Some(t),
+            last_in_ear: Some(t),
+        }
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn walking_away_while_worn_fires_once_then_comes_back() {
+        let (c, t0) = (cfg(), Instant::now());
+        let mut j = Judge::default();
+        let mut r = worn_at(t0);
+        let st = j.step(&c, &r, "buds", t0);
+        assert!(st.armed && st.verdict.is_none(), "becoming armed is not news");
+
+        r.connected = false;
+        let st = j.step(&c, &r, "buds", t0 + secs(2));
+        assert_eq!(st.verdict, Some(Verdict::Away("buds disconnected".into())));
+        // Still gone: no repeat.
+        assert_eq!(j.step(&c, &r, "buds", t0 + secs(4)).verdict, None);
+        assert_eq!(j.step(&c, &r, "buds", t0 + secs(6)).verdict, None);
+
+        r.connected = true;
+        let st = j.step(&c, &r, "buds", t0 + secs(8));
+        assert_eq!(st.verdict, Some(Verdict::Back("buds is back".into())));
+    }
+
+    #[test]
+    fn buds_into_the_case_do_not_fire() {
+        // The false lock the in-ear gate exists for: both buds out (and the
+        // advertisement says so), then the case closes and the link drops.
+        let (c, t0) = (cfg(), Instant::now());
+        let mut j = Judge::default();
+        let mut r = worn_at(t0);
+        j.step(&c, &r, "buds", t0);
+
+        r.in_ear = Some(false);
+        let st = j.step(&c, &r, "buds", t0 + secs(2));
+        assert!(!st.armed && !st.worn);
+        assert_eq!(st.verdict, None, "taking them out is not leaving");
+
+        r.connected = false;
+        assert_eq!(j.step(&c, &r, "buds", t0 + secs(4)).verdict, None);
+    }
+
+    #[test]
+    fn in_ear_memory_running_out_while_connected_does_not_fire() {
+        // Used to fire "worn beacon went quiet" and lock a person sitting at
+        // the desk with the buds connected but not worn for ten minutes.
+        let (c, t0) = (cfg(), Instant::now());
+        let mut j = Judge::default();
+        let r = worn_at(t0);
+        j.step(&c, &r, "buds", t0);
+        let st = j.step(&c, &r, "buds", t0 + secs(c.in_ear_memory_secs + 1));
+        assert!(!st.armed);
+        assert_eq!(st.verdict, None);
+    }
+
+    #[test]
+    fn starting_up_disconnected_or_unworn_is_not_news() {
+        let (c, t0) = (cfg(), Instant::now());
+        let mut j = Judge::default();
+        let r = Reading::default();
+        for i in 0..5 {
+            assert_eq!(j.step(&c, &r, "buds", t0 + secs(i * 2)).verdict, None);
+        }
+    }
+
+    #[test]
+    fn without_require_in_ear_any_link_drop_counts() {
+        let c = Beacon { require_in_ear: false, ..cfg() };
+        let t0 = Instant::now();
+        let mut j = Judge::default();
+        let mut r = Reading { connected: true, ..Reading::default() };
+        assert!(j.step(&c, &r, "headset", t0).armed);
+        r.connected = false;
+        assert_eq!(
+            j.step(&c, &r, "headset", t0 + secs(2)).verdict,
+            Some(Verdict::Away("headset disconnected".into()))
+        );
+    }
+
+    #[test]
+    fn distance_path_needs_the_signal_to_stay_low() {
+        let c = Beacon { away_rssi: -80, rssi_hold_secs: 15, ..cfg() };
+        let t0 = Instant::now();
+        let mut j = Judge::default();
+        let mut r = worn_at(t0);
+        j.step(&c, &r, "buds", t0);
+
+        r.rssi = Some(-90.0);
+        assert_eq!(j.step(&c, &r, "buds", t0 + secs(2)).verdict, None);
+        // A single good reading resets the hold timer.
+        r.rssi = Some(-70.0);
+        assert_eq!(j.step(&c, &r, "buds", t0 + secs(10)).verdict, None);
+        r.rssi = Some(-90.0);
+        assert_eq!(j.step(&c, &r, "buds", t0 + secs(12)).verdict, None);
+        assert_eq!(j.step(&c, &r, "buds", t0 + secs(20)).verdict, None);
+        let st = j.step(&c, &r, "buds", t0 + secs(27));
+        assert!(matches!(st.verdict, Some(Verdict::Away(ref d)) if d.contains("is far")));
+
+        r.rssi = Some(-60.0);
+        assert!(matches!(j.step(&c, &r, "buds", t0 + secs(29)).verdict, Some(Verdict::Back(_))));
+    }
+
+    #[test]
+    fn distance_path_is_off_by_default() {
+        let (c, t0) = (cfg(), Instant::now());
+        let mut j = Judge::default();
+        let mut r = worn_at(t0);
+        r.rssi = Some(-100.0);
+        for i in 0..30 {
+            assert_eq!(j.step(&c, &r, "buds", t0 + secs(i)).verdict, None);
+        }
+    }
+
+    #[test]
+    fn silence_backstop() {
+        let c = Beacon { silence_secs: 60, ..cfg() };
+        let t0 = Instant::now();
+        let mut j = Judge::default();
+        let r = worn_at(t0);
+        assert_eq!(j.step(&c, &r, "buds", t0 + secs(59)).verdict, None);
+        let st = j.step(&c, &r, "buds", t0 + secs(60));
+        assert_eq!(st.verdict, Some(Verdict::Away("buds stopped advertising".into())));
     }
 
     #[test]
