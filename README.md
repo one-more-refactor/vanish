@@ -73,7 +73,10 @@ Every trigger starts a countdown rather than locking. During it:
   countdown is on screen.
 
 Only the source that started a countdown can cancel it. Your headset coming
-back says nothing about a USB stick that is still on the floor.
+back says nothing about a USB stick that is still on the floor. An absence
+reported while another countdown is running, or during the cooldown below, is
+remembered and gets its own countdown as soon as nothing is in the way; a lock
+answers every absence known at that moment.
 
 After a lock there is a cooldown (default 60s). Without one, a bluetooth link
 that flaps re-locks the session while you are typing your password into it.

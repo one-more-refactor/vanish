@@ -280,7 +280,7 @@ fn parse_duration(s: &str) -> Result<u64> {
         _ => (s, 1),
     };
     let n: u64 = num.parse().map_err(|_| anyhow::anyhow!("not a duration: {s:?}"))?;
-    Ok(n * mult)
+    n.checked_mul(mult).ok_or_else(|| anyhow::anyhow!("duration too long: {s:?}"))
 }
 
 fn human(secs: u64) -> String {
@@ -302,6 +302,7 @@ mod tests {
         assert_eq!(parse_duration("30m").unwrap(), 1800);
         assert_eq!(parse_duration("2h").unwrap(), 7200);
         assert!(parse_duration("soon").is_err());
+        assert!(parse_duration("18446744073709551615h").is_err());
     }
 
     #[test]
